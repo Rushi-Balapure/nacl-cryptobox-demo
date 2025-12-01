@@ -8,8 +8,10 @@ import nacl.bindings
 import json
 import base64
 import platform
+import os
 
 SERVER_URL = "http://127.0.0.1:5000"
+DEVICE_ID_PATH = "device_id.txt"
 
 # --- CONFIGURATION ---
 # Load Long-Term Agent Private Key
@@ -21,10 +23,50 @@ with open("agent.pri", "rb") as f:
 with open("server.pub", "rb") as f:
     SERVER_PUB_KEY = nacl.signing.VerifyKey(f.read(), encoder=nacl.encoding.HexEncoder)
 
+
+def load_or_register_device():
+    """
+    Ensure this agent has a device_id by registering its public key with the server once.
+    """
+    if os.path.exists(DEVICE_ID_PATH):
+        with open(DEVICE_ID_PATH, "r", encoding="utf-8") as f:
+            device_id = f.read().strip()
+            if device_id:
+                return device_id
+
+    # No device_id yet: register with server
+    device_info = {
+        "os": platform.system(),
+        "release": platform.release(),
+        "hostname": platform.node(),
+    }
+    payload = {
+        "device_public_key": AGENT_PUB_HEX,
+        "device_info": device_info,
+    }
+    print("[AGENT] Registering device with server...")
+    res = requests.post(f"{SERVER_URL}/register_device", json=payload, timeout=5)
+    res.raise_for_status()
+    data = res.json()
+    device_id = data["device_id"]
+
+    with open(DEVICE_ID_PATH, "w", encoding="utf-8") as f:
+        f.write(device_id)
+
+    print(f"[AGENT] Registered device_id={device_id}")
+    return device_id
+
+
 def run_agent():
+    device_id = load_or_register_device()
+
     # --- Step 3 (Receive) ---
     print("[AGENT] Requesting handshake...")
-    response = requests.post(f"{SERVER_URL}/handshake/init")
+    response = requests.post(
+        f"{SERVER_URL}/handshake/init",
+        json={"device_id": device_id},
+        timeout=5,
+    )
     data = response.json()
     
     signed_envelope = base64.b64decode(data['signed_envelope'])
@@ -54,8 +96,12 @@ def run_agent():
         agent_eph_pri.encode(),
         server_eph_pub.encode()
     )
-    # KDF to get symmetric key
-    ecdh_key = nacl.hash.blake2b(shared_point, digest_size=32)
+    # KDF to get symmetric key (raw 32 bytes, not hex-encoded)
+    ecdh_key = nacl.hash.blake2b(
+        shared_point,
+        digest_size=32,
+        encoder=nacl.encoding.RawEncoder,
+    )
 
     # --- Step 7: Solve Challenge ---
     # We define the solution as SHA256(challenge)
@@ -90,12 +136,42 @@ def run_agent():
 
     # --- Step 10: Forward to Server ---
     final_payload = {
-        'outer_envelope': base64.b64encode(signed_outer).decode('utf-8')
+        'outer_envelope': base64.b64encode(signed_outer).decode('utf-8'),
+        'device_id': device_id,
     }
 
     print("[AGENT] Sending encrypted proofs...")
-    res = requests.post(f"{SERVER_URL}/handshake/verify", json=final_payload)
-    print(f"[AGENT] Server Response: {res.json()}")
+    res = requests.post(
+        f"{SERVER_URL}/handshake/verify",
+        json=final_payload,
+        timeout=5,
+    )
+    verify_result = res.json()
+    print(f"[AGENT] Server Handshake Response: {verify_result}")
+
+    if verify_result.get("status") != "trusted":
+        print("[AGENT] Handshake failed; aborting secure message.")
+        return
+
+    session_id = verify_result["session_id"]
+
+    # --- Secure message over established session key ---
+    secure_box = nacl.secret.SecretBox(ecdh_key)
+    message = "Hello Server, this is a post-handshake secure message from the agent."
+    ciphertext = secure_box.encrypt(message.encode("utf-8"))
+
+    secure_payload = {
+        "session_id": session_id,
+        "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
+    }
+
+    print("[AGENT] Sending secure message over session...")
+    secure_res = requests.post(
+        f"{SERVER_URL}/secure_message",
+        json=secure_payload,
+        timeout=5,
+    )
+    print(f"[AGENT] Secure message response: {secure_res.json()}")
 
 if __name__ == "__main__":
     run_agent()

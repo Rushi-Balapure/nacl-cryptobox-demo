@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# Keys
+*.pri # Private keys
+*.pub # Public keys
+server.pri
+server.pub
+agent.pri
+agent.pub
