@@ -10,7 +10,7 @@ import base64
 import platform
 import os
 
-SERVER_URL = "http://127.0.0.1:5000"
+SERVER_URL = "http://10.0.2.15:5000"
 DEVICE_ID_PATH = "device_id.txt"
 
 # --- CONFIGURATION ---
