@@ -49,6 +49,16 @@ devices = load_device_registry()
 session_store = {}
 
 
+@app.route("/server_pub", methods=["GET"])
+def server_public_key():
+    """
+    Expose the server's long-term public key so agents can fetch it.
+    In a real deployment you'd still pin or verify this key out of band.
+    """
+    server_pub_hex = SERVER_PRI.verify_key.encode(encoder=nacl.encoding.HexEncoder).decode()
+    return jsonify({"server_public_key": server_pub_hex})
+
+
 @app.route("/register_device", methods=["POST"])
 def register_device():
     """
@@ -263,4 +273,4 @@ def secure_message():
 
 if __name__ == '__main__':
     print("Server running on port 5000...")
-    app.run(port=5000, debug=True)
+    app.run(host="0.0.0.0",port=5000, debug=True)

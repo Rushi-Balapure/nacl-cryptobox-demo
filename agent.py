@@ -19,10 +19,6 @@ with open("agent.pri", "rb") as f:
     AGENT_PRI = nacl.signing.SigningKey(f.read(), encoder=nacl.encoding.HexEncoder)
     AGENT_PUB_HEX = AGENT_PRI.verify_key.encode(encoder=nacl.encoding.HexEncoder).decode()
 
-# Load Known Server Public Key
-with open("server.pub", "rb") as f:
-    SERVER_PUB_KEY = nacl.signing.VerifyKey(f.read(), encoder=nacl.encoding.HexEncoder)
-
 
 def load_or_register_device():
     """
@@ -57,8 +53,21 @@ def load_or_register_device():
     return device_id
 
 
+def fetch_server_verify_key():
+    """
+    Fetch the server's long-term public key from the /server_pub endpoint.
+    """
+    print("[AGENT] Fetching server public key...")
+    res = requests.get(f"{SERVER_URL}/server_pub", timeout=5)
+    res.raise_for_status()
+    data = res.json()
+    server_pub_hex = data["server_public_key"]
+    return nacl.signing.VerifyKey(server_pub_hex, encoder=nacl.encoding.HexEncoder)
+
+
 def run_agent():
     device_id = load_or_register_device()
+    server_verify_key = fetch_server_verify_key()
 
     # --- Step 3 (Receive) ---
     print("[AGENT] Requesting handshake...")
@@ -73,7 +82,7 @@ def run_agent():
 
     # --- Step 4: Verify Server Signature ---
     try:
-        verified_bytes = SERVER_PUB_KEY.verify(signed_envelope)
+        verified_bytes = server_verify_key.verify(signed_envelope)
         server_payload = json.loads(verified_bytes.decode('utf-8'))
         print("[AGENT] Server Signature Verified.")
     except nacl.exceptions.BadSignatureError:
