@@ -15,6 +15,10 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 SERVER_URL = "http://127.0.0.1:5001"
 DEVICE_ID_PATH = "device_id_crypto.txt"
 
+# REG_TOKEN is the out-of-band shared secret entered by the user.
+# For this demo we read it from the environment or fall back to a static value.
+REG_TOKEN = os.environ.get("REG_TOKEN", "demo-reg-token-1234")
+
 
 def derive_session_key(shared_secret: bytes) -> bytes:
     """
@@ -27,6 +31,27 @@ def derive_session_key(shared_secret: bytes) -> bytes:
         info=b"device-trust-ecdh",
     )
     return hkdf.derive(shared_secret)
+
+
+def derive_binding_key(reg_token: str) -> bytes:
+    """
+    Derive a 32-byte symmetric key from the REG_TOKEN using HKDF,
+    matching the registration KDF described in the README.
+    """
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"registration_v1",
+        info=b"device_binding",
+    )
+    return hkdf.derive(reg_token.encode("utf-8"))
+
+
+def compute_reg_handle(binding_key: bytes) -> str:
+    """
+    Compute an opaque registration handle from the binding key.
+    """
+    return hashlib.sha256(binding_key).hexdigest()[:32]
 
 
 # --- CONFIGURATION ---
@@ -47,7 +72,9 @@ AGENT_PUB_HEX = binascii.hexlify(
 
 def load_or_register_device() -> str:
     """
-    Ensure this agent has a device_id by registering its public key with the server once.
+    Phase I – Steps 2 & 3 (Agent side):
+    Ensure this agent has a device_id by registering its public key with the server once,
+    using an encrypted payload bound to the REG_TOKEN.
     """
     if os.path.exists(DEVICE_ID_PATH):
         with open(DEVICE_ID_PATH, "r", encoding="utf-8") as f:
@@ -60,11 +87,26 @@ def load_or_register_device() -> str:
         "release": platform.release(),
         "hostname": platform.node(),
     }
-    payload = {
+
+    binding_key = derive_binding_key(REG_TOKEN)
+    reg_handle = compute_reg_handle(binding_key)
+
+    inner_payload = {
         "device_public_key": AGENT_PUB_HEX,
         "device_info": device_info,
     }
-    print("[AGENT-CRYPTO] Registering device with server...")
+
+    aead = ChaCha20Poly1305(binding_key)
+    nonce = os.urandom(12)
+    ciphertext = aead.encrypt(nonce, json.dumps(inner_payload).encode("utf-8"), None)
+    encrypted_payload = base64.b64encode(nonce + ciphertext).decode("utf-8")
+
+    payload = {
+        "reg_handle": reg_handle,
+        "encrypted_payload": encrypted_payload,
+    }
+
+    print("[AGENT-CRYPTO] Registering device with server (encrypted binding)...")
     res = requests.post(f"{SERVER_URL}/register_device", json=payload, timeout=5)
     res.raise_for_status()
     data = res.json()
@@ -94,7 +136,7 @@ def run_agent():
     device_id = load_or_register_device()
     server_verify_key = fetch_server_verify_key()
 
-    # --- Step 3 (Receive) ---
+    # Phase II – Step 5: Request CHALLENGE and server-ephemeral.pub from the server.
     print("[AGENT-CRYPTO] Requesting handshake...")
     response = requests.post(
         f"{SERVER_URL}/handshake/init",
@@ -106,7 +148,7 @@ def run_agent():
 
     signed_envelope = base64.b64decode(data["signed_envelope"])
 
-    # --- Step 4: Verify Server Signature ---
+    # Phase II – Step 6: Verify server signature and parse CHALLENGE + server-ephemeral.pub.
     try:
         signature = signed_envelope[:64]
         message_bytes = signed_envelope[64:]
@@ -117,24 +159,24 @@ def run_agent():
         print("[AGENT-CRYPTO] Error: Fake Server Detected!")
         return
 
-    # Extract Data
+    # Extract Data (CHALLENGE, server-ephemeral.pub, session_id).
     challenge = base64.b64decode(server_payload["challenge"])
     server_eph_pub_bytes = base64.b64decode(server_payload["server_eph_pub"])
     server_eph_pub = x25519.X25519PublicKey.from_public_bytes(server_eph_pub_bytes)
     session_id = server_payload["session_id"]
 
-    # --- Step 5: Generate Agent Ephemeral Keys ---
+    # Phase II – Step 7: Generate agent-ephemeral key pair.
     agent_eph_pri = x25519.X25519PrivateKey.generate()
     agent_eph_pub = agent_eph_pri.public_key()
 
-    # --- Step 6: Generate ECDH Key ---
+    # Phase II – Step 8: Generate ECDH-based session key.
     shared_secret = agent_eph_pri.exchange(server_eph_pub)
     ecdh_key = derive_session_key(shared_secret)
 
-    # --- Step 7: Solve Challenge ---
+    # Phase II – Step 9: Solve CHALLENGE to produce CHALLENGE_RESPONSE.
     challenge_response = hashlib.sha256(challenge).digest()
 
-    # --- Step 8: Prepare Inner Box (Crypto-Box) ---
+    # Phase II – Step 10: Prepare Inner Box (Crypto-Box).
     inner_payload = {
         "challenge_response": base64.b64encode(challenge_response).decode("utf-8"),
         "agent_pub_long_term": AGENT_PUB_HEX,
@@ -151,7 +193,7 @@ def run_agent():
     ciphertext = aead.encrypt(nonce, json.dumps(inner_payload).encode("utf-8"), None)
     encrypted_inner_b64 = base64.b64encode(nonce + ciphertext).decode("utf-8")
 
-    # --- Step 9: Prepare Outer Box ---
+    # Phase II – Step 11: Prepare Outer Box (wrap Inner Box + agent-ephemeral.pub).
     agent_eph_pub_bytes = agent_eph_pri.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
@@ -167,7 +209,7 @@ def run_agent():
     outer_sig = AGENT_PRI.sign(outer_bytes)
     signed_outer = outer_sig + outer_bytes
 
-    # --- Step 10: Forward to Server ---
+    # Phase II – Step 12: Forward Outer Box (signed) to the server.
     final_payload = {
         "outer_envelope": base64.b64encode(signed_outer).decode("utf-8"),
         "device_id": device_id,
@@ -189,7 +231,7 @@ def run_agent():
 
     session_id = verify_result["session_id"]
 
-    # --- Secure message over established session key ---
+    # Post-Handshake: Use established session key for secure application messages.
     secure_box = ChaCha20Poly1305(ecdh_key)
     message = "Hello Server (cryptography version), this is a post-handshake secure message."
     nonce2 = os.urandom(12)

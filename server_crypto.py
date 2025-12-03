@@ -52,6 +52,31 @@ devices = load_device_registry()
 #   }
 session_store = {}
 
+# --- Registration Shared Secret (REG_TOKEN) ---
+# In a real system this is generated per-device in an admin portal and
+# communicated out-of-band. For this demo we read it from the environment
+# or fall back to a static value.
+REG_TOKEN = os.environ.get("REG_TOKEN", "demo-reg-token-1234")
+
+
+def derive_binding_key(reg_token: str) -> bytes:
+    """
+    Derive a 32-byte symmetric key from the REG_TOKEN using HKDF,
+    matching the registration KDF described in the README.
+    """
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"registration_v1",
+        info=b"device_binding",
+    )
+    return hkdf.derive(reg_token.encode("utf-8"))
+
+
+REG_BINDING_KEY = derive_binding_key(REG_TOKEN)
+REG_HANDLE = hashlib.sha256(REG_BINDING_KEY).hexdigest()[:32]
+used_reg_handles = set()
+
 
 def derive_session_key(shared_secret: bytes) -> bytes:
     """
@@ -83,20 +108,40 @@ def server_public_key():
 @app.route("/register_device", methods=["POST"])
 def register_device():
     """
-    Step 2: Device registration.
+    Phase I – Steps 2 & 3 (Server side):
+    Secure device registration using a REG_TOKEN-derived binding key.
 
     Expects JSON:
     {
-        "device_public_key": "<hex-encoded Ed25519 verify key>",
-        "device_info": {...}
+        "reg_handle": "<opaque handle derived from REG_TOKEN>",
+        "encrypted_payload": "<base64-encoded nonce+ciphertext>"
     }
     """
     data = request.json or {}
-    device_pub = data.get("device_public_key")
-    device_info = data.get("device_info", {})
+    reg_handle = data.get("reg_handle")
+    encrypted_payload_b64 = data.get("encrypted_payload")
+
+    if not reg_handle or not encrypted_payload_b64:
+        return jsonify({"error": "reg_handle and encrypted_payload are required"}), 400
+
+    # One-time use and handle validation
+    if reg_handle != REG_HANDLE or reg_handle in used_reg_handles:
+        return jsonify({"error": "invalid or already used registration handle"}), 403
+
+    try:
+        encrypted = base64.b64decode(encrypted_payload_b64)
+        nonce, ciphertext = encrypted[:12], encrypted[12:]
+        aead = ChaCha20Poly1305(REG_BINDING_KEY)
+        decrypted_bytes = aead.decrypt(nonce, ciphertext, None)
+        payload = json.loads(decrypted_bytes.decode("utf-8"))
+    except Exception as e:
+        return jsonify({"error": f"decryption failed: {e}"}), 403
+
+    device_pub = payload.get("device_public_key")
+    device_info = payload.get("device_info", {})
 
     if not device_pub:
-        return jsonify({"error": "device_public_key is required"}), 400
+        return jsonify({"error": "device_public_key missing in decrypted payload"}), 400
 
     # Basic sanity check: hex string length for Ed25519 public key (32 bytes -> 64 hex chars)
     if not isinstance(device_pub, str) or len(device_pub) != 64:
@@ -110,6 +155,9 @@ def register_device():
     }
     save_device_registry(devices)
 
+    # Mark this handle as used to prevent replay of the same REG_TOKEN binding.
+    used_reg_handles.add(reg_handle)
+
     return jsonify(
         {
             "device_id": device_id,
@@ -120,7 +168,11 @@ def register_device():
 
 @app.route("/handshake/init", methods=["POST"])
 def init_handshake():
-    """Step 2 & 3: Generate Challenge and send Signed Packet for a given device."""
+    """
+    Phase II – Steps 4 & 5:
+    Generate CHALLENGE and server-ephemeral key pair, then send a signed packet
+    to the Agent containing these values.
+    """
 
     data = request.json or {}
     device_id = data.get("device_id")
@@ -131,7 +183,7 @@ def init_handshake():
     if not device_record or device_record.get("revoked"):
         return jsonify({"error": "Unknown or revoked device"}), 403
 
-    # 2. Generate Challenge and Ephemeral Keypair (X25519)
+    # Phase II – Step 4: Generate CHALLENGE and server-ephemeral key pair (X25519).
     challenge = os.urandom(32)
     server_eph_pri = x25519.X25519PrivateKey.generate()
     server_eph_pub = server_eph_pri.public_key()
@@ -146,7 +198,7 @@ def init_handshake():
         "ecdh_key": None,
     }
 
-    # Prepare payload
+    # Phase II – Step 5: Prepare payload to send to the Agent.
     server_eph_pub_bytes = server_eph_pub.public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
@@ -157,7 +209,7 @@ def init_handshake():
         "server_eph_pub": base64.b64encode(server_eph_pub_bytes).decode("utf-8"),
     }
 
-    # 3. Sign the payload using Server Long-term Private Key
+    # Sign the payload using Server long-term private key (Ed25519).
     message_bytes = json.dumps(payload).encode("utf-8")
     signature = SERVER_PRI.sign(message_bytes)  # 64-byte Ed25519 signature
     signed_envelope = signature + message_bytes
@@ -171,7 +223,11 @@ def init_handshake():
 
 @app.route("/handshake/verify", methods=["POST"])
 def verify_handshake():
-    """Step 11 - 15: Verify Agent Response."""
+    """
+    Phase II – Steps 13–17:
+    Verify Agent response, derive the shared session key, decrypt the Inner Box,
+    perform anti-MITM binding checks, and validate the CHALLENGE_RESPONSE.
+    """
     data = request.json or {}
     outer_envelope_b64 = data.get("outer_envelope")
     device_id = data.get("device_id")
@@ -190,7 +246,7 @@ def verify_handshake():
     outer_envelope = base64.b64decode(outer_envelope_b64)
 
     try:
-        # 11. Verify signature using Agent's Long-term Public Key
+        # Phase II – Step 13: Verify outer box signature using Agent's long-term public key.
         signature = outer_envelope[:64]
         outer_bytes = outer_envelope[64:]
         verify_key.verify(signature, outer_bytes)
@@ -201,22 +257,22 @@ def verify_handshake():
         if session_id not in session_store:
             return "Session invalid", 400
 
-        # Retrieve stored context
+        # Retrieve stored context (server-ephemeral.pri, original CHALLENGE).
         server_eph_pri = session_store[session_id]["server_eph_pri"]
         original_challenge = session_store[session_id]["challenge"]
 
-        # Extract Agent Ephemeral Public Key
+        # Extract Agent Ephemeral Public Key (agent-ephemeral.pub).
         agent_eph_pub_bytes = base64.b64decode(outer_box_content["agent_eph_pub"])
         agent_eph_pub = x25519.X25519PublicKey.from_public_bytes(agent_eph_pub_bytes)
 
-        # 12. Compute ECDH Key (Shared Secret)
+        # Phase II – Step 14: Compute shared ECDH key (session key material).
         shared_secret = server_eph_pri.exchange(agent_eph_pub)
         ecdh_key = derive_session_key(shared_secret)
 
         # Save derived session key for later secure API calls
         session_store[session_id]["ecdh_key"] = ecdh_key
 
-        # 13. Decrypt Inner Box (Crypto-Box)
+        # Phase II – Step 15: Decrypt Inner Box (Crypto-Box) using the session key.
         encrypted_inner_b64 = outer_box_content["inner_box"]
         encrypted_inner = base64.b64decode(encrypted_inner_b64)
         nonce, ciphertext = encrypted_inner[:12], encrypted_inner[12:]
@@ -226,12 +282,12 @@ def verify_handshake():
 
         print(f"\n[SERVER-CRYPTO] Decrypted Inner Data: {inner_data}")
 
-        # 14. Verify Agent ID match (Anti-MITM)
+        # Phase II – Step 16: Verify Agent ID match (anti-MITM binding check).
         agent_pub_inside = inner_data["agent_pub_long_term"]
         if agent_pub_inside != device_pub_hex:
             raise Exception("MITM DETECTED: Outer signature key does not match Inner encrypted ID")
 
-        # 15. Verify Challenge Response
+        # Phase II – Step 17: Verify CHALLENGE_RESPONSE and device identity.
         challenge_response = base64.b64decode(inner_data["challenge_response"])
         expected_response = hashlib.sha256(original_challenge).digest()
 

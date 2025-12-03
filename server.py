@@ -48,6 +48,38 @@ devices = load_device_registry()
 #   }
 session_store = {}
 
+# --- Registration Shared Secret (REG_TOKEN) ---
+# In a real system this is generated per-device in an admin portal and
+# communicated out-of-band. For this demo we read it from the environment
+# or fall back to a static value.
+REG_TOKEN = os.environ.get("REG_TOKEN", "demo-reg-token-1234")
+
+
+def derive_binding_key(token: str) -> bytes:
+    """
+    Derive a 32-byte symmetric key from the REG_TOKEN.
+
+    For the NaCl demo we use blake2b as a KDF and SecretBox (XSalsa20-Poly1305)
+    for AEAD, which is analogous to the HKDF+ChaCha20-Poly1305 described in
+    the README.
+    """
+    return nacl.hash.blake2b(
+        token.encode("utf-8"),
+        digest_size=32,
+        encoder=nacl.encoding.RawEncoder,
+    )
+
+
+REG_BINDING_KEY = derive_binding_key(REG_TOKEN)
+REG_HANDLE = nacl.hash.blake2b(
+    REG_BINDING_KEY,
+    digest_size=16,
+    encoder=nacl.encoding.HexEncoder,
+).decode()
+
+# Track used registration handles to ensure one-time use
+used_reg_handles = set()
+
 
 @app.route("/server_pub", methods=["GET"])
 def server_public_key():
@@ -62,20 +94,39 @@ def server_public_key():
 @app.route("/register_device", methods=["POST"])
 def register_device():
     """
-    Step 2: Device registration.
+    Phase I – Steps 2 & 3 (Server side):
+    Secure device registration using a REG_TOKEN-derived binding key.
 
     Expects JSON:
     {
-        "device_public_key": "<hex-encoded Ed25519 verify key>",
-        "device_info": {...}
+        "reg_handle": "<opaque handle derived from REG_TOKEN>",
+        "encrypted_payload": "<base64-encoded SecretBox ciphertext>"
     }
     """
     data = request.json or {}
-    device_pub = data.get("device_public_key")
-    device_info = data.get("device_info", {})
+    reg_handle = data.get("reg_handle")
+    encrypted_payload_b64 = data.get("encrypted_payload")
+
+    if not reg_handle or not encrypted_payload_b64:
+        return jsonify({"error": "reg_handle and encrypted_payload are required"}), 400
+
+    # One-time use and handle validation
+    if reg_handle != REG_HANDLE or reg_handle in used_reg_handles:
+        return jsonify({"error": "invalid or already used registration handle"}), 403
+
+    try:
+        ciphertext = base64.b64decode(encrypted_payload_b64)
+        box = nacl.secret.SecretBox(REG_BINDING_KEY)
+        decrypted_bytes = box.decrypt(ciphertext)
+        payload = json.loads(decrypted_bytes.decode("utf-8"))
+    except Exception as e:
+        return jsonify({"error": f"decryption failed: {e}"}), 403
+
+    device_pub = payload.get("device_public_key")
+    device_info = payload.get("device_info", {})
 
     if not device_pub:
-        return jsonify({"error": "device_public_key is required"}), 400
+        return jsonify({"error": "device_public_key missing in decrypted payload"}), 400
 
     # Basic sanity check: hex string length for Ed25519 public key (32 bytes -> 64 hex chars)
     if not isinstance(device_pub, str) or len(device_pub) != 64:
@@ -89,6 +140,9 @@ def register_device():
     }
     save_device_registry(devices)
 
+    # Mark this handle as used to prevent replay of the same REG_TOKEN binding.
+    used_reg_handles.add(reg_handle)
+
     return jsonify(
         {
             "device_id": device_id,
@@ -98,7 +152,11 @@ def register_device():
 
 @app.route('/handshake/init', methods=['POST'])
 def init_handshake():
-    """ Step 2 & 3: Generate Challenge and send Signed Packet for a given device """
+    """
+    Phase II – Steps 4 & 5:
+    Generate CHALLENGE and server-ephemeral key pair, then send a signed packet
+    to the Agent containing these values.
+    """
 
     data = request.json or {}
     device_id = data.get("device_id")
@@ -109,7 +167,7 @@ def init_handshake():
     if not device_record or device_record.get("revoked"):
         return jsonify({"error": "Unknown or revoked device"}), 403
 
-    # 2. Generate Challenge and Ephemeral Keypair (Curve25519)
+    # Phase II – Step 4: Generate CHALLENGE and server-ephemeral key pair (Curve25519).
     challenge = nacl.utils.random(32)
     server_eph_pri = nacl.public.PrivateKey.generate()
     server_eph_pub = server_eph_pri.public_key
@@ -124,14 +182,14 @@ def init_handshake():
         'ecdh_key': None,
     }
 
-    # Prepare payload
+    # Phase II – Step 5: Prepare payload to send to the Agent.
     payload = {
         'session_id': session_id,
         'challenge': base64.b64encode(challenge).decode('utf-8'),
         'server_eph_pub': base64.b64encode(server_eph_pub.encode()).decode('utf-8')
     }
 
-    # 3. Sign the payload using Server Long-term Private Key
+    # Sign the payload using Server long-term private key (Ed25519).
     # We dump JSON to bytes, then sign it.
     message_bytes = json.dumps(payload).encode('utf-8')
     signed = SERVER_PRI.sign(message_bytes)
@@ -143,7 +201,11 @@ def init_handshake():
 
 @app.route('/handshake/verify', methods=['POST'])
 def verify_handshake():
-    """ Step 11 - 15: Verify Agent Response """
+    """
+    Phase II – Steps 13–17:
+    Verify Agent response, derive the shared session key, decrypt the Inner Box,
+    perform anti-MITM binding checks, and validate the CHALLENGE_RESPONSE.
+    """
     data = request.json or {}
     outer_envelope_b64 = data.get('outer_envelope')
     device_id = data.get('device_id')
@@ -161,7 +223,7 @@ def verify_handshake():
     outer_envelope = base64.b64decode(outer_envelope_b64)
 
     try:
-        # 11. Verify signature using Agent's Long-term Public Key
+        # Phase II – Step 13: Verify outer box signature using Agent's long-term public key.
         # If verify fails, it raises BadSignatureError
         verified_data_bytes = verify_key.verify(outer_envelope)
         outer_box_content = json.loads(verified_data_bytes.decode('utf-8'))
@@ -170,15 +232,15 @@ def verify_handshake():
         if session_id not in session_store:
             return "Session invalid", 400
 
-        # Retrieve stored context
+        # Retrieve stored context (server-ephemeral.pri, original CHALLENGE).
         server_eph_pri = session_store[session_id]['server_eph_pri']
         original_challenge = session_store[session_id]['challenge']
 
-        # Extract Agent Ephemeral Public Key
+        # Extract Agent Ephemeral Public Key (agent-ephemeral.pub).
         agent_eph_pub_bytes = base64.b64decode(outer_box_content['agent_eph_pub'])
         agent_eph_pub = nacl.public.PublicKey(agent_eph_pub_bytes)
 
-        # 12. Compute ECDH Key (Shared Secret)
+        # Phase II – Step 14: Compute shared ECDH key (session key material).
         # ECDH(server_pri, agent_pub)
         # Note: NaCl Box does hashing internally, but to strictly follow "derive key", we do this:
         shared_point = nacl.bindings.crypto_scalarmult(
@@ -195,7 +257,7 @@ def verify_handshake():
         # Save derived session key for later secure API calls
         session_store[session_id]['ecdh_key'] = ecdh_key
 
-        # 13. Decrypt Inner Box (Crypto-Box)
+        # Phase II – Step 15: Decrypt Inner Box (Crypto-Box) using the session key.
         # We use SecretBox (Symmetric) because we derived the key manually via ECDH
         box = nacl.secret.SecretBox(ecdh_key)
         encrypted_inner = base64.b64decode(outer_box_content['inner_box'])
@@ -205,14 +267,14 @@ def verify_handshake():
 
         print(f"\n[SERVER] Decrypted Inner Data: {inner_data}")
 
-        # 14. Verify Agent ID match (Anti-MITM)
+        # Phase II – Step 16: Verify Agent ID match (anti-MITM binding check).
         # Compare the ID inside the encrypted box with the one registered for this device
         agent_pub_inside = inner_data['agent_pub_long_term']
 
         if agent_pub_inside != device_pub_hex:
             raise Exception("MITM DETECTED: Outer signature key does not match Inner encrypted ID")
 
-        # 15. Verify Challenge Response
+        # Phase II – Step 17: Verify CHALLENGE_RESPONSE and device identity.
         challenge_response = base64.b64decode(inner_data['challenge_response'])
         # Simple verification: Check if response is SHA256(challenge)
         expected_response = nacl.hash.sha256(original_challenge)
